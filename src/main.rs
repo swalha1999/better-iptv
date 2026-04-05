@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod app;
 mod downloader;
 mod epg;
@@ -31,8 +34,43 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xtream::XtreamProvider;
+
+/// Read current process RSS from /proc/self/status (Linux only). Returns MB.
+fn get_rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .map(|kb| kb / 1024.0)
+        .unwrap_or(0.0)
+}
+
+/// Log Arc strong counts and memory info for debugging.
+fn log_memory_diagnostics(app: &App) {
+    let rss = get_rss_mb();
+    let playlist_refs = Arc::strong_count(&app.playlist);
+    let epg_refs = app.epg.as_ref().map(|e| Arc::strong_count(e)).unwrap_or(0);
+    let playlist_channels = app.playlist.channels.len();
+    let epg_programmes = app.epg.as_ref().map(|e| e.programme_count()).unwrap_or(0);
+
+    app.log.info("memory", format!(
+        "RSS: {:.0} MB | Playlist Arc refs: {} ({} channels) | EPG Arc refs: {} ({} programmes) | Favorites: {} | Downloads: {}",
+        rss,
+        playlist_refs,
+        playlist_channels,
+        epg_refs,
+        epg_programmes,
+        app.favorites.len(),
+        app.download_manager.pending_count(),
+    ));
+}
 
 struct CliArgs {
     provider: Provider,
@@ -98,6 +136,15 @@ fn main() -> anyhow::Result<()> {
                 );
                 Some(epg)
             }
+        } else if is_url {
+            let epg = Epg::parse_xmltv_url(source)?;
+            eprintln!(
+                "Loaded EPG: {} programmes for {} channels in {:.1}s",
+                epg.programme_count(),
+                epg.channel_count(),
+                epg_start.elapsed().as_secs_f64()
+            );
+            Some(epg)
         } else {
             let epg = Epg::parse_xmltv_file(std::path::Path::new(source))?;
             eprintln!(
@@ -312,7 +359,7 @@ fn print_help() {
 fn run_tui(playlist: model::Playlist, epg: Option<Epg>, hdhr_port: Option<u16>, hdhr_bind: String, buffer_mode: hdhr::BufferMode, buffer_secs: f64, refresh_hours: f64, provider: Provider, epg_source: Option<String>, used_cache: bool) -> anyhow::Result<()> {
     // Start HDHR server before entering raw mode so we can print the port
     let hdhr_state = if let Some(port) = hdhr_port {
-        let server = hdhr::HdhrServer::new(port, hdhr_bind.clone(), playlist.clone(), crate::favorites::load_favorites(), epg.clone(), buffer_mode.clone(), buffer_secs);
+        let server = hdhr::HdhrServer::new(port, hdhr_bind.clone(), Arc::new(playlist.clone()), crate::favorites::load_favorites(), epg.as_ref().map(|e| Arc::new(e.clone())), buffer_mode.clone(), buffer_secs);
         let hdhr_state = server.state();
         let actual_port = server.start()?;
         let mode_str = match &buffer_mode {
@@ -390,8 +437,13 @@ fn run_tui(playlist: model::Playlist, epg: Option<Epg>, hdhr_port: Option<u16>, 
                             break;
                         }
                     }
+                    eprintln!("[refresh] Starting playlist refresh...");
+                    let refresh_start = std::time::Instant::now();
                     match provider.load() {
                         Ok(new_playlist) => {
+                            eprintln!("[refresh] Playlist loaded: {} channels ({:.1}s)",
+                                new_playlist.channels.len(),
+                                refresh_start.elapsed().as_secs_f64());
                             // Fetch EPG sequentially after playlist
                             let fresh_epg = epg_url_for_refresh.as_deref().and_then(|src| {
                                 if src.starts_with("http://") || src.starts_with("https://") {
@@ -400,6 +452,9 @@ fn run_tui(playlist: model::Playlist, epg: Option<Epg>, hdhr_port: Option<u16>, 
                                     Epg::parse_xmltv_file(std::path::Path::new(src)).ok()
                                 }
                             });
+                            eprintln!("[refresh] Total refresh took {:.1}s (EPG: {})",
+                                refresh_start.elapsed().as_secs_f64(),
+                                if fresh_epg.is_some() { "loaded" } else { "none" });
                             if refresh_tx.send((new_playlist, fresh_epg)).is_err() {
                                 break;
                             }
@@ -463,25 +518,78 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
+    let mut last_memory_log = Instant::now();
+    let memory_log_interval = Duration::from_secs(300); // every 5 minutes
+
+    // Log initial memory state
+    log_memory_diagnostics(&app);
+
     loop {
         app.poll_search_results();
+
+        // Periodic memory diagnostics
+        if last_memory_log.elapsed() >= memory_log_interval {
+            log_memory_diagnostics(&app);
+            last_memory_log = Instant::now();
+        }
 
         // Check for playlist+EPG refresh
         if let Some(ref rx) = app.refresh_rx {
             if let Ok((new_playlist, fresh_epg)) = rx.try_recv() {
+                app.log.info("refresh", format!("Refresh received — playlist: {} channels, EPG: {}",
+                    new_playlist.channels.len(),
+                    if fresh_epg.is_some() { "yes" } else { "no" }
+                ));
+                log_memory_diagnostics(&app);
+                app.log.info("refresh-mem", "--- BEGIN refresh_playlist ---");
                 app.refresh_playlist(new_playlist);
+                app.log.info("refresh-mem", "--- END refresh_playlist ---");
+                log_memory_diagnostics(&app);
                 if let Some(new_epg) = fresh_epg {
+                    let rss_pre_epg = get_rss_mb();
+                    let old_epg_refs = app.epg.as_ref().map(|e| Arc::strong_count(e)).unwrap_or(0);
+                    let old_epg_progs = app.epg.as_ref().map(|e| e.programme_count()).unwrap_or(0);
+                    let new_epg_progs = new_epg.programme_count();
+                    app.log.info("refresh-mem", format!(
+                        "EPG STEP 0: RSS={:.0}MB | old EPG refs={} ({} progs) | new EPG has {} progs",
+                        rss_pre_epg, old_epg_refs, old_epg_progs, new_epg_progs
+                    ));
+
                     app.epg_last_refresh = Some(chrono::Utc::now());
+                    let epg_arc = Arc::new(new_epg);
                     if let Some(ref hdhr_state) = app.hdhr_state {
                         let mut state = hdhr_state.lock().unwrap();
-                        state.epg = Some(new_epg.clone());
+                        state.epg = Some(Arc::clone(&epg_arc));
                     }
-                    let playlist_arc = std::sync::Arc::new(app.playlist.clone());
-                    let epg_arc = Some(std::sync::Arc::new(new_epg.clone()));
-                    app.epg_search_engine = Some(epg_search::EpgSearchEngine::new(playlist_arc, epg_arc));
-                    let prog_count = new_epg.programme_count();
-                    let ch_count = new_epg.channel_count();
-                    app.epg = Some(new_epg);
+
+                    // Drop old epg_search_engine before rebuilding (release old EPG Arc)
+                    app.epg_search_engine = None;
+                    let rss_after_old_drop = get_rss_mb();
+                    app.log.info("refresh-mem", format!(
+                        "EPG STEP 1 (drop old epg_search): RSS={:.0}MB (delta={:+.0}) | old EPG refs={}",
+                        rss_after_old_drop, rss_after_old_drop - rss_pre_epg,
+                        app.epg.as_ref().map(|e| Arc::strong_count(e)).unwrap_or(0)
+                    ));
+
+                    app.epg_search_engine = Some(epg_search::EpgSearchEngine::new(
+                        Arc::clone(&app.playlist),
+                        Some(Arc::clone(&epg_arc)),
+                    ));
+
+                    let prog_count = epg_arc.programme_count();
+                    let ch_count = epg_arc.channel_count();
+
+                    // Swap EPG — old Arc dropped
+                    let old_epg_strong = app.epg.as_ref().map(|e| Arc::strong_count(e)).unwrap_or(0);
+                    app.epg = Some(epg_arc);
+                    let rss_after_epg_swap = get_rss_mb();
+                    app.log.info("refresh-mem", format!(
+                        "EPG STEP 2 (swap epg): RSS={:.0}MB (delta={:+.0}) | old EPG had {} refs | new EPG refs={}",
+                        rss_after_epg_swap, rss_after_epg_swap - rss_pre_epg,
+                        old_epg_strong,
+                        app.epg.as_ref().map(|e| Arc::strong_count(e)).unwrap_or(0)
+                    ));
+
                     app.guide_state.channels_dirty = true;
                     let msg = format!(
                         "Playlist + EPG refreshed: {} programmes for {} channels",
@@ -490,6 +598,8 @@ fn run_event_loop(
                     app.log.info("refresh", &msg);
                     app.status_message = Some(msg);
                 }
+                app.log.info("refresh-mem", "--- FINAL STATE ---");
+                log_memory_diagnostics(&app);
             }
         }
 
@@ -497,16 +607,18 @@ fn run_event_loop(
         if let Some(ref rx) = app.epg_refresh_rx {
             if let Ok(new_epg) = rx.try_recv() {
                 app.epg_last_refresh = Some(chrono::Utc::now());
+                let epg_arc = Arc::new(new_epg);
                 if let Some(ref hdhr_state) = app.hdhr_state {
                     let mut state = hdhr_state.lock().unwrap();
-                    state.epg = Some(new_epg.clone());
+                    state.epg = Some(Arc::clone(&epg_arc));
                 }
-                let playlist_arc = std::sync::Arc::new(app.playlist.clone());
-                let epg_arc = Some(std::sync::Arc::new(new_epg.clone()));
-                app.epg_search_engine = Some(epg_search::EpgSearchEngine::new(playlist_arc, epg_arc));
-                let prog_count = new_epg.programme_count();
-                let ch_count = new_epg.channel_count();
-                app.epg = Some(new_epg);
+                app.epg_search_engine = Some(epg_search::EpgSearchEngine::new(
+                    Arc::clone(&app.playlist),
+                    Some(Arc::clone(&epg_arc)),
+                ));
+                let prog_count = epg_arc.programme_count();
+                let ch_count = epg_arc.channel_count();
+                app.epg = Some(epg_arc);
                 app.guide_state.channels_dirty = true;
                 let msg = format!(
                     "EPG refreshed: {} programmes for {} channels",

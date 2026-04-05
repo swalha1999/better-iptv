@@ -82,9 +82,9 @@ struct LineupEntry {
 
 /// Shared state for the HDHR server — favorites can change at runtime.
 pub struct HdhrState {
-    pub playlist: Playlist,
+    pub playlist: Arc<Playlist>,
     pub favorites: HashSet<String>,
-    pub epg: Option<Epg>,
+    pub epg: Option<Arc<Epg>>,
     pub buffer_mode: BufferMode,
     pub buffer_secs: f64,
 }
@@ -96,7 +96,7 @@ pub struct HdhrServer {
 }
 
 impl HdhrServer {
-    pub fn new(port: u16, bind_addr: String, playlist: Playlist, favorites: HashSet<String>, epg: Option<Epg>, buffer_mode: BufferMode, buffer_secs: f64) -> Self {
+    pub fn new(port: u16, bind_addr: String, playlist: Arc<Playlist>, favorites: HashSet<String>, epg: Option<Arc<Epg>>, buffer_mode: BufferMode, buffer_secs: f64) -> Self {
         Self {
             port,
             bind_addr,
@@ -556,7 +556,7 @@ mod tests {
         let playlist = Playlist { channels, groups, group_indices };
         let favorites: HashSet<String> = favs.into_iter().map(|s| s.to_string()).collect();
         Arc::new(Mutex::new(HdhrState {
-            playlist,
+            playlist: Arc::new(playlist),
             favorites,
             epg: None,
             buffer_mode: BufferMode::None,

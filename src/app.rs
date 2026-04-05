@@ -291,7 +291,7 @@ pub enum Focus {
 }
 
 pub struct App {
-    pub playlist: Playlist,
+    pub playlist: Arc<Playlist>,
     pub selected_group: usize,
     pub selected_channel: usize,
     pub mode: AppMode,
@@ -300,7 +300,7 @@ pub struct App {
     pub search_results: Vec<usize>,
     pub favorites: HashSet<String>,
     pub show_favorites_only: bool,
-    pub epg: Option<Epg>,
+    pub epg: Option<Arc<Epg>>,
     pub status_message: Option<String>,
     pub should_quit: bool,
     pub search_pending: bool,
@@ -348,6 +348,20 @@ pub struct App {
 }
 
 impl App {
+    /// Read current process RSS from /proc/self/status (Linux only). Returns MB.
+    fn get_rss_mb() -> f64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+            .map(|kb| kb / 1024.0)
+            .unwrap_or(0.0)
+    }
+
     pub fn new(playlist: Playlist, epg: Option<Epg>) -> Self {
         let mut favorites = favorites::load_favorites();
 
@@ -365,13 +379,15 @@ impl App {
 
         eprintln!("Loaded {} favorites", favorites.len());
 
+        // Wrap in Arc — single shared copy for app, search engines, HDHR
+        let playlist = Arc::new(playlist);
+        let epg = epg.map(Arc::new);
+
         let search_engine = SearchEngine::new(&playlist);
 
         // Create EPG search engine if EPG data is available
         let epg_search_engine = if epg.is_some() {
-            let playlist_arc = Arc::new(playlist.clone());
-            let epg_arc = epg.as_ref().map(|e| Arc::new(e.clone()));
-            Some(EpgSearchEngine::new(playlist_arc, epg_arc))
+            Some(EpgSearchEngine::new(Arc::clone(&playlist), epg.as_ref().map(Arc::clone)))
         } else {
             None
         };
@@ -443,26 +459,71 @@ impl App {
         let old_count = self.playlist.channels.len();
         self.playlist_last_refresh = Utc::now();
         self.refresh_in_progress = false;
-        let _new_count = new_playlist.channels.len();
 
-        // Rebuild search engine with new data
-        self.search_engine = SearchEngine::new(&new_playlist);
+        let rss_before = Self::get_rss_mb();
+        let old_playlist_refs = std::sync::Arc::strong_count(&self.playlist);
+        let old_epg_refs = self.epg.as_ref().map(|e| std::sync::Arc::strong_count(e)).unwrap_or(0);
+        self.log.info("refresh-mem", format!(
+            "STEP 0 (before): RSS={:.0}MB | old playlist refs={} ({} ch) | old EPG refs={}",
+            rss_before, old_playlist_refs, old_count, old_epg_refs
+        ));
+
+        // Drop old EPG search engine to release old Arc references
+        self.epg_search_engine = None;
+
+        let rss_after_epg_drop = Self::get_rss_mb();
+        let refs_after_drop = std::sync::Arc::strong_count(&self.playlist);
+        self.log.info("refresh-mem", format!(
+            "STEP 1 (drop epg_search_engine): RSS={:.0}MB (delta={:+.0}) | old playlist refs={}",
+            rss_after_epg_drop, rss_after_epg_drop - rss_before, refs_after_drop
+        ));
+
+        // Wrap new playlist in Arc — shared by app, search engines, HDHR (ZERO deep clones)
+        let new_arc = Arc::new(new_playlist);
+
+        // Refresh search engine in-place (reuses nucleo threadpool, no new threads)
+        self.search_engine.refresh(&new_arc);
+
+        let rss_after_search = Self::get_rss_mb();
+        self.log.info("refresh-mem", format!(
+            "STEP 2 (search refresh): RSS={:.0}MB (delta={:+.0}) | new playlist refs={} | old playlist refs={}",
+            rss_after_search, rss_after_search - rss_before,
+            std::sync::Arc::strong_count(&new_arc),
+            std::sync::Arc::strong_count(&self.playlist)
+        ));
 
         // Rebuild EPG search engine if EPG exists
         if self.epg.is_some() {
-            let playlist_arc = Arc::new(new_playlist.clone());
-            let epg_arc = self.epg.as_ref().map(|e| Arc::new(e.clone()));
-            self.epg_search_engine = Some(EpgSearchEngine::new(playlist_arc, epg_arc));
+            self.epg_search_engine = Some(EpgSearchEngine::new(
+                Arc::clone(&new_arc),
+                self.epg.as_ref().map(Arc::clone),
+            ));
+            let rss_after_epg_rebuild = Self::get_rss_mb();
+            self.log.info("refresh-mem", format!(
+                "STEP 3 (epg search rebuild): RSS={:.0}MB (delta={:+.0}) | new playlist refs={} | EPG refs={}",
+                rss_after_epg_rebuild, rss_after_epg_rebuild - rss_before,
+                std::sync::Arc::strong_count(&new_arc),
+                self.epg.as_ref().map(|e| std::sync::Arc::strong_count(e)).unwrap_or(0)
+            ));
         }
 
         // Update HDHR state if active
         if let Some(ref hdhr_state) = self.hdhr_state {
             let mut state = hdhr_state.lock().unwrap();
-            state.playlist = new_playlist.clone();
+            state.playlist = Arc::clone(&new_arc);
         }
 
-        // Swap playlist
-        self.playlist = new_playlist;
+        // Swap — old Arc dropped (freed if no other refs)
+        let old_playlist_strong = std::sync::Arc::strong_count(&self.playlist);
+        self.playlist = new_arc;
+
+        let rss_after_swap = Self::get_rss_mb();
+        self.log.info("refresh-mem", format!(
+            "STEP 4 (swap playlist): RSS={:.0}MB (delta={:+.0}) | old playlist had {} refs before swap | new playlist refs={}",
+            rss_after_swap, rss_after_swap - rss_before,
+            old_playlist_strong,
+            std::sync::Arc::strong_count(&self.playlist)
+        ));
 
         // Reset selections to safe values
         if self.selected_group >= self.playlist.groups.len() {
@@ -1220,18 +1281,20 @@ impl App {
             // For simplicity, block briefly then check
             if let Ok(Ok(new_epg)) = rx.recv_timeout(std::time::Duration::from_secs(30)) {
                 self.epg_last_refresh = Some(Utc::now());
+                let epg_arc = Arc::new(new_epg);
                 // Update HDHR state
                 if let Some(ref hdhr_state) = self.hdhr_state {
                     let mut state = hdhr_state.lock().unwrap();
-                    state.epg = Some(new_epg.clone());
+                    state.epg = Some(Arc::clone(&epg_arc));
                 }
-                // Rebuild EPG search engine
-                let playlist_arc = Arc::new(self.playlist.clone());
-                let epg_arc = Some(Arc::new(new_epg.clone()));
-                self.epg_search_engine = Some(EpgSearchEngine::new(playlist_arc, epg_arc));
-                let prog_count = new_epg.programme_count();
-                let ch_count = new_epg.channel_count();
-                self.epg = Some(new_epg);
+                // Rebuild EPG search engine — zero clones, just Arc bumps
+                self.epg_search_engine = Some(EpgSearchEngine::new(
+                    Arc::clone(&self.playlist),
+                    Some(Arc::clone(&epg_arc)),
+                ));
+                let prog_count = epg_arc.programme_count();
+                let ch_count = epg_arc.channel_count();
+                self.epg = Some(epg_arc);
                 self.guide_state.channels_dirty = true;
                 self.status_message = Some(format!(
                     "EPG refreshed: {} programmes for {} channels",

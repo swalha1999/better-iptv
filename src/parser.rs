@@ -188,14 +188,13 @@ fn detect_content_type(name: &str, group: &str) -> ContentType {
 
 fn parse_series_info(name: &str) -> Option<ContentType> {
     // Look for patterns like S01E02, S1E1
-    let name_upper = name.to_uppercase();
     let mut i = 0;
-    let bytes = name_upper.as_bytes();
+    let bytes = name.as_bytes();
 
     while i < bytes.len() {
-        if bytes[i] == b'S' {
+        if bytes[i] == b'S' || bytes[i] == b's' {
             if let Some((season, next)) = parse_number(&bytes[i + 1..]) {
-                if next < bytes.len() - i - 1 && bytes[i + 1 + next] == b'E' {
+                if next < bytes.len() - i - 1 && (bytes[i + 1 + next] == b'E' || bytes[i + 1 + next] == b'e') {
                     if let Some((episode, _)) = parse_number(&bytes[i + 2 + next..]) {
                         // Extract series name (everything before the SxxExx pattern)
                         let series_name = name[..i].trim().trim_end_matches(&['-', ' ', '.'][..]);

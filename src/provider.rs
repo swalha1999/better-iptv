@@ -24,14 +24,56 @@ impl Provider {
                 if let Some(p) = path {
                     parser::parse_m3u_file(p)
                 } else if let Some(u) = url {
+                    eprintln!("Fetching M3U playlist from {u}");
+                    let start = std::time::Instant::now();
                     let response = ureq::get(u)
                         .timeout(std::time::Duration::from_secs(120))
                         .call()
                         .with_context(|| format!("Failed to fetch M3U from {u}"))?;
-                    // Read into memory so we can both cache and parse
-                    let mut data = Vec::new();
-                    response.into_reader().read_to_end(&mut data)
-                        .context("Failed to read M3U response")?;
+                    let content_length: Option<u64> = response
+                        .header("Content-Length")
+                        .and_then(|s| s.parse().ok());
+                    match content_length {
+                        Some(len) => eprintln!(
+                            "  Connected, downloading {:.2} MB...",
+                            len as f64 / 1_048_576.0
+                        ),
+                        None => eprintln!("  Connected, downloading (unknown size)..."),
+                    }
+                    // Read into memory in chunks so we can report progress.
+                    let mut data = Vec::with_capacity(
+                        content_length.unwrap_or(0) as usize,
+                    );
+                    let mut reader = response.into_reader();
+                    let mut buf = [0u8; 64 * 1024];
+                    let mut last_report = std::time::Instant::now();
+                    loop {
+                        let n = reader
+                            .read(&mut buf)
+                            .context("Failed to read M3U response")?;
+                        if n == 0 {
+                            break;
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                        if last_report.elapsed() >= std::time::Duration::from_secs(2) {
+                            let mb = data.len() as f64 / 1_048_576.0;
+                            match content_length {
+                                Some(len) if len > 0 => {
+                                    let pct = (data.len() as f64 / len as f64) * 100.0;
+                                    eprintln!(
+                                        "  Downloaded {mb:.2} MB ({pct:.1}%)"
+                                    );
+                                }
+                                _ => eprintln!("  Downloaded {mb:.2} MB"),
+                            }
+                            last_report = std::time::Instant::now();
+                        }
+                    }
+                    eprintln!(
+                        "  Finished: {:.2} MB in {:.1}s",
+                        data.len() as f64 / 1_048_576.0,
+                        start.elapsed().as_secs_f64()
+                    );
                     // Cache to disk
                     cache::save_playlist(&data, Some(u));
                     let cursor = std::io::Cursor::new(data);

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tikv-jemallocator = "0.6"
 ratatui = "0.29"
 crossterm = "0.28"
 nucleo = "0.5"
