@@ -322,7 +322,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<CliArgs> {
 }
 
 fn print_help() {
-    println!("Usage: iptv [OPTIONS]");
+    println!("Usage: better-iptv [OPTIONS]");
     println!();
     println!("M3U source:");
     println!("  -p, --playlist <path>        Path to M3U playlist file");
