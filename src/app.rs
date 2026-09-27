@@ -3,7 +3,8 @@ use crate::epg::Epg;
 use crate::epg_search::EpgSearchEngine;
 use crate::favorites;
 use crate::hdhr::HdhrState;
-use crate::model::Playlist;
+use crate::model::{ContentType, Playlist};
+use crate::xtream::XtreamProvider;
 use crate::log::AppLog;
 use crate::player::{self, Player};
 use crate::recorder::{Recorder, RecordingStatus};
@@ -17,6 +18,10 @@ use std::sync::{mpsc, Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
+    /// Startup screen: pick Live TV / Movies / Series.
+    Home,
+    /// Episode picker for a selected series.
+    Episodes,
     Normal,
     Search,
     Help,
@@ -290,6 +295,54 @@ pub enum Focus {
     Channels,
 }
 
+/// Top-level content section chosen on the start screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Section {
+    Live,
+    Movies,
+    Series,
+}
+
+impl Section {
+    pub const ALL: [Section; 3] = [Section::Live, Section::Movies, Section::Series];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Section::Live => "Live TV",
+            Section::Movies => "Movies",
+            Section::Series => "Series",
+        }
+    }
+
+    pub fn unit(&self) -> &'static str {
+        match self {
+            Section::Live => "channels",
+            Section::Movies => "titles",
+            Section::Series => "shows",
+        }
+    }
+
+    pub fn matches(&self, ct: &ContentType) -> bool {
+        matches!(
+            (self, ct),
+            (Section::Live, ContentType::Live)
+                | (Section::Movies, ContentType::Movie)
+                | (Section::Series, ContentType::Series { .. })
+        )
+    }
+}
+
+pub struct EpisodeItem {
+    pub label: String,
+    pub url: String,
+}
+
+pub struct EpisodesState {
+    pub series_name: String,
+    pub episodes: Vec<EpisodeItem>,
+    pub selected: usize,
+}
+
 pub struct App {
     pub playlist: Arc<Playlist>,
     pub selected_group: usize,
@@ -345,6 +398,16 @@ pub struct App {
     pub tz_selected: usize,
     pub tz_search: String,
     pub tz_filtered: Vec<usize>,
+    /// Content section chosen on the start screen (None = show everything).
+    pub section: Option<Section>,
+    /// Cursor on the start screen.
+    pub home_selected: usize,
+    /// Indices into playlist.groups that belong to the current section.
+    pub section_groups: Vec<usize>,
+    /// Episode picker state (Series section).
+    pub episodes_state: Option<EpisodesState>,
+    /// Xtream provider, when the playlist came from one (needed for series info).
+    pub xtream: Option<XtreamProvider>,
 }
 
 impl App {
@@ -402,12 +465,19 @@ impl App {
         let recording_dir = download_dir.join("recordings");
         let recorder = Recorder::new(recording_dir);
 
+        let all_groups: Vec<usize> = (0..playlist.groups.len()).collect();
+
         Self {
             playlist,
             selected_group: 0,
             selected_channel: 0,
-            mode: AppMode::Normal,
+            mode: AppMode::Home,
             focus: Focus::Groups,
+            section: None,
+            home_selected: 0,
+            section_groups: all_groups,
+            episodes_state: None,
+            xtream: None,
             search_query: String::new(),
             search_results: Vec::new(),
             favorites,
@@ -526,8 +596,9 @@ impl App {
         ));
 
         // Reset selections to safe values
-        if self.selected_group >= self.playlist.groups.len() {
-            self.selected_group = 0;
+        self.recompute_section_groups();
+        if !self.section_groups.contains(&self.selected_group) {
+            self.selected_group = self.section_groups.first().copied().unwrap_or(0);
         }
         self.selected_channel = 0;
         self.favorites_dirty = true;
@@ -564,6 +635,17 @@ impl App {
     }
 
     pub fn current_channel_indices(&self) -> Vec<usize> {
+        let indices = self.current_channel_indices_unfiltered();
+        match self.section {
+            Some(section) => indices
+                .into_iter()
+                .filter(|&i| section.matches(&self.playlist.channels[i].content_type))
+                .collect(),
+            None => indices,
+        }
+    }
+
+    fn current_channel_indices_unfiltered(&self) -> Vec<usize> {
         // Show search results in both Search mode (typing) and Normal mode (locked results)
         if !self.search_query.is_empty() && !self.search_results.is_empty() {
             return self.search_results.clone();
@@ -596,8 +678,9 @@ impl App {
     pub fn move_up(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if self.selected_group > 0 {
-                    self.selected_group -= 1;
+                let pos = self.group_pos();
+                if pos > 0 {
+                    self.selected_group = self.section_groups[pos - 1];
                     self.selected_channel = 0;
                 }
             }
@@ -612,8 +695,9 @@ impl App {
     pub fn move_down(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if self.selected_group + 1 < self.playlist.groups.len() {
-                    self.selected_group += 1;
+                let pos = self.group_pos();
+                if pos + 1 < self.section_groups.len() {
+                    self.selected_group = self.section_groups[pos + 1];
                     self.selected_channel = 0;
                 }
             }
@@ -629,7 +713,7 @@ impl App {
     pub fn jump_top(&mut self) {
         match self.focus {
             Focus::Groups => {
-                self.selected_group = 0;
+                self.selected_group = self.section_groups.first().copied().unwrap_or(0);
                 self.selected_channel = 0;
             }
             Focus::Channels => {
@@ -641,8 +725,8 @@ impl App {
     pub fn jump_bottom(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if !self.playlist.groups.is_empty() {
-                    self.selected_group = self.playlist.groups.len() - 1;
+                if let Some(&last) = self.section_groups.last() {
+                    self.selected_group = last;
                     self.selected_channel = 0;
                 }
             }
@@ -755,13 +839,205 @@ impl App {
     }
 
     pub fn launch_selected(&mut self) {
-        if let Some(url) = self.selected_channel_url() {
-            let url = url.to_string();
+        let indices = self.current_channel_indices();
+        let Some(&ch_idx) = indices.get(self.selected_channel) else {
+            return;
+        };
+        let is_series = matches!(
+            self.playlist.channels[ch_idx].content_type,
+            ContentType::Series { .. }
+        );
+        if is_series && self.xtream.is_some() {
+            self.open_series_episodes(ch_idx);
+            return;
+        }
+        let url = self.playlist.channels[ch_idx].url.to_string();
+        match player::launch(self.selected_player, &url, &self.log) {
+            Ok(_) => self.status_message = Some(format!("Launching {}...", self.selected_player)),
+            Err(e) => self.status_message = Some(format!("{} error: {e}", self.selected_player)),
+        }
+    }
+
+    // ----- Start screen / sections -----
+
+    pub fn section_count(&self, section: Section) -> usize {
+        self.playlist
+            .channels
+            .iter()
+            .filter(|c| section.matches(&c.content_type))
+            .count()
+    }
+
+    /// Number of channels in a group that belong to the current section.
+    pub fn group_count(&self, group_idx: usize) -> usize {
+        let group = &self.playlist.groups[group_idx];
+        let members = self.playlist.channels_in_group(group);
+        match self.section {
+            Some(section) => members
+                .iter()
+                .filter(|&&i| section.matches(&self.playlist.channels[i].content_type))
+                .count(),
+            None => members.len(),
+        }
+    }
+
+    fn recompute_section_groups(&mut self) {
+        self.section_groups = match self.section {
+            Some(section) => (0..self.playlist.groups.len())
+                .filter(|&gi| {
+                    let group = &self.playlist.groups[gi];
+                    self.playlist
+                        .channels_in_group(group)
+                        .iter()
+                        .any(|&i| section.matches(&self.playlist.channels[i].content_type))
+                })
+                .collect(),
+            None => (0..self.playlist.groups.len()).collect(),
+        };
+    }
+
+    pub fn visible_groups(&self) -> &[usize] {
+        &self.section_groups
+    }
+
+    fn group_pos(&self) -> usize {
+        self.section_groups
+            .iter()
+            .position(|&g| g == self.selected_group)
+            .unwrap_or(0)
+    }
+
+    pub fn select_section(&mut self, section: Section) {
+        self.section = Some(section);
+        self.recompute_section_groups();
+        self.selected_group = self.section_groups.first().copied().unwrap_or(0);
+        self.selected_channel = 0;
+        self.focus = Focus::Groups;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.show_favorites_only = false;
+        self.mode = AppMode::Normal;
+    }
+
+    pub fn go_home(&mut self) {
+        self.search_query.clear();
+        self.search_results.clear();
+        self.home_selected = self
+            .section
+            .and_then(|s| Section::ALL.iter().position(|&x| x == s))
+            .unwrap_or(0);
+        self.mode = AppMode::Home;
+    }
+
+    pub fn home_move_up(&mut self) {
+        if self.home_selected > 0 {
+            self.home_selected -= 1;
+        }
+    }
+
+    pub fn home_move_down(&mut self) {
+        if self.home_selected + 1 < Section::ALL.len() {
+            self.home_selected += 1;
+        }
+    }
+
+    pub fn home_select(&mut self) {
+        self.select_section(Section::ALL[self.home_selected]);
+    }
+
+    // ----- Series episode picker -----
+
+    pub fn open_series_episodes(&mut self, ch_idx: usize) {
+        let (name, series_id) = {
+            let ch = &self.playlist.channels[ch_idx];
+            let id = ch
+                .url
+                .split("series_id=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .and_then(|s| s.parse::<u64>().ok());
+            (ch.name.to_string(), id)
+        };
+        let (Some(provider), Some(series_id)) = (self.xtream.clone(), series_id) else {
+            self.status_message = Some(format!("Cannot resolve series id for {name}"));
+            return;
+        };
+        self.log.info("series", format!("Fetching episodes for {name} (id {series_id})"));
+        match provider.fetch_series_episodes(series_id) {
+            Ok(eps) if eps.is_empty() => {
+                self.status_message = Some(format!("No episodes found for {name}"));
+            }
+            Ok(eps) => {
+                let episodes = eps
+                    .into_iter()
+                    .map(|e| EpisodeItem {
+                        label: if e.title.is_empty() {
+                            format!("S{:02}E{:02}", e.season, e.episode)
+                        } else {
+                            format!("S{:02}E{:02}  {}", e.season, e.episode, e.title)
+                        },
+                        url: e.url,
+                    })
+                    .collect();
+                self.episodes_state = Some(EpisodesState {
+                    series_name: name,
+                    episodes,
+                    selected: 0,
+                });
+                self.mode = AppMode::Episodes;
+            }
+            Err(e) => {
+                self.log.info("series", format!("Failed to load episodes for {name}: {e}"));
+                self.status_message = Some(format!("Failed to load episodes: {e}"));
+            }
+        }
+    }
+
+    pub fn episodes_move_up(&mut self) {
+        if let Some(s) = &mut self.episodes_state {
+            if s.selected > 0 {
+                s.selected -= 1;
+            }
+        }
+    }
+
+    pub fn episodes_move_down(&mut self) {
+        if let Some(s) = &mut self.episodes_state {
+            if s.selected + 1 < s.episodes.len() {
+                s.selected += 1;
+            }
+        }
+    }
+
+    pub fn episodes_jump_top(&mut self) {
+        if let Some(s) = &mut self.episodes_state {
+            s.selected = 0;
+        }
+    }
+
+    pub fn episodes_jump_bottom(&mut self) {
+        if let Some(s) = &mut self.episodes_state {
+            s.selected = s.episodes.len().saturating_sub(1);
+        }
+    }
+
+    pub fn episodes_launch_selected(&mut self) {
+        let url = self
+            .episodes_state
+            .as_ref()
+            .and_then(|s| s.episodes.get(s.selected))
+            .map(|e| e.url.clone());
+        if let Some(url) = url {
             match player::launch(self.selected_player, &url, &self.log) {
                 Ok(_) => self.status_message = Some(format!("Launching {}...", self.selected_player)),
                 Err(e) => self.status_message = Some(format!("{} error: {e}", self.selected_player)),
             }
         }
+    }
+
+    pub fn exit_episodes(&mut self) {
+        self.episodes_state = None;
+        self.mode = AppMode::Normal;
     }
 
     pub fn enter_logs(&mut self) {

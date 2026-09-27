@@ -1,4 +1,4 @@
-use crate::app::{App, AppMode, Focus, GuideViewMode, SeriesRow};
+use crate::app::{App, AppMode, Focus, GuideViewMode, Section, SeriesRow};
 use crate::downloader::DownloadStatus;
 use crate::log::LogLevel;
 use crate::recorder::RecordingStatus;
@@ -10,6 +10,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &App) {
+    if app.mode == AppMode::Home {
+        draw_home(f, app);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
@@ -55,13 +60,137 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.mode == AppMode::Timezone {
         draw_timezone_overlay(f, app);
     }
+
+    if app.mode == AppMode::Episodes {
+        draw_episodes_overlay(f, app);
+    }
+}
+
+fn draw_home(f: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  What do you want to watch?",
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for (i, section) in Section::ALL.iter().enumerate() {
+        let selected = i == app.home_selected;
+        let marker = if selected { "> " } else { "  " };
+        let count = app.section_count(*section);
+        let text = format!(
+            "{marker}{}. {:<10} {:>6} {}",
+            i + 1,
+            section.label(),
+            count,
+            section.unit()
+        );
+        let style = if selected {
+            Style::default()
+                .fg(app.theme.highlight)
+                .bg(app.theme.selected_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.text)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  j/k move   Enter open   1/2/3 jump   P player   q quit",
+        Style::default().fg(app.theme.text_subtle),
+    )));
+
+    let menu = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" IPTV  [{}] ", app.selected_player))
+            .style(Style::default().bg(app.theme.surface))
+            .border_style(Style::default().fg(app.theme.accent)),
+    );
+
+    f.render_widget(menu, area);
+}
+
+fn draw_episodes_overlay(f: &mut Frame, app: &App) {
+    let Some(state) = &app.episodes_state else {
+        return;
+    };
+    let area = centered_rect(70, 80, f.area());
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let items: Vec<ListItem> = state
+        .episodes
+        .iter()
+        .enumerate()
+        .map(|(i, ep)| {
+            let style = if i == state.selected {
+                Style::default()
+                    .fg(app.theme.success)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+            ListItem::new(format!("  {}", ep.label)).style(style)
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " {} ({} episodes) ",
+                    state.series_name,
+                    state.episodes.len()
+                ))
+                .style(Style::default().bg(app.theme.surface))
+                .border_style(Style::default().fg(app.theme.accent)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(app.theme.selected_bg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    let hint = Paragraph::new(format!(
+        " j/k move  Enter play  g/G top/bottom  P player  Esc back   [{}]",
+        app.selected_player
+    ))
+    .style(
+        Style::default()
+            .fg(app.theme.text_subtle)
+            .bg(app.theme.surface),
+    );
+    f.render_widget(hint, chunks[1]);
 }
 
 fn draw_groups(f: &mut Frame, app: &App, area: Rect) {
     let title = if app.mode == AppMode::Search {
-        " Search Results "
+        " Search Results ".to_string()
+    } else if let Some(section) = app.section {
+        format!(" {} · Groups ", section.label())
     } else {
-        " Groups "
+        " Groups ".to_string()
     };
 
     let border_style = if app.focus == Focus::Groups && app.mode == AppMode::Normal {
@@ -70,15 +199,14 @@ fn draw_groups(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(app.theme.text_subtle)
     };
 
-    let items: Vec<ListItem> = app
-        .playlist
-        .groups
+    let visible = app.visible_groups();
+    let items: Vec<ListItem> = visible
         .iter()
-        .enumerate()
-        .map(|(i, group)| {
-            let count = app.playlist.channels_in_group(group).len();
+        .map(|&gi| {
+            let group = &app.playlist.groups[gi];
+            let count = app.group_count(gi);
             let text = format!("  {} ({count})", group);
-            let style = if i == app.selected_group && app.mode != AppMode::Search {
+            let style = if gi == app.selected_group && app.mode != AppMode::Search {
                 Style::default()
                     .fg(app.theme.highlight)
                     .add_modifier(Modifier::BOLD)
@@ -91,7 +219,7 @@ fn draw_groups(f: &mut Frame, app: &App, area: Rect) {
 
     let mut state = ListState::default();
     if app.mode != AppMode::Search {
-        state.select(Some(app.selected_group));
+        state.select(visible.iter().position(|&g| g == app.selected_group));
     }
 
     let list = List::new(items)
@@ -211,13 +339,16 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 String::new()
             };
             let right = format!(
-                "{}{}  {} channels  [{}] ",
+                "{}{}{}  {} channels  [{}] ",
                 dl_indicator,
                 if app.show_favorites_only {
                     "★ "
                 } else {
                     ""
                 },
+                app.section
+                    .map(|s| format!("{} · ", s.label()))
+                    .unwrap_or_default(),
                 app.playlist.channels.len(),
                 app.selected_player,
             );
@@ -254,6 +385,8 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         Line::from(""),
         Line::from("  j/k or ↑/↓     Navigate lists"),
         Line::from("  h/l or ←/→     Switch focus (groups/channels)"),
+        Line::from("  1/2/3           Switch section (Live/Movies/Series)"),
+        Line::from("  Esc/Backspace   Back to start screen"),
         Line::from("  g               Jump to top"),
         Line::from("  G               Open TV Guide"),
         Line::from("  /               Enter search mode"),

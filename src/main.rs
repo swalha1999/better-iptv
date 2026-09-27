@@ -386,6 +386,9 @@ fn run_tui(playlist: model::Playlist, epg: Option<Epg>, hdhr_port: Option<u16>, 
 
     let has_epg = epg.is_some();
     let mut app = App::new(playlist, epg);
+    if let Provider::Xtream(ref p) = provider {
+        app.xtream = Some(p.clone());
+    }
     app.hdhr_state = hdhr_state;
     app.sync_hdhr_favorites(); // Ensure HDHR has migrated favorites
     if has_epg {
@@ -669,6 +672,8 @@ fn run_event_loop(
 
                 if !handled {
                     match &app.mode {
+                        AppMode::Home => handle_home_key(app, key.code),
+                        AppMode::Episodes => handle_episodes_key(app, key.code),
                         AppMode::Search => handle_search_key(app, key.code),
                         AppMode::Guide => handle_guide_key(app, key.code),
                         AppMode::Downloads => handle_downloads_key(app, key.code),
@@ -697,16 +702,54 @@ fn run_event_loop(
     }
 }
 
+fn handle_home_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('j') | KeyCode::Down => app.home_move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.home_move_up(),
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.home_select(),
+        KeyCode::Char('1') => app.select_section(app::Section::Live),
+        KeyCode::Char('2') => app.select_section(app::Section::Movies),
+        KeyCode::Char('3') => app.select_section(app::Section::Series),
+        KeyCode::Char('P') => app.cycle_player(),
+        KeyCode::Char('t') => {
+            app.theme = theme::next_theme(app.theme.name);
+        }
+        _ => {}
+    }
+}
+
+fn handle_episodes_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+            app.exit_episodes()
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.episodes_move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.episodes_move_up(),
+        KeyCode::Char('g') | KeyCode::Home => app.episodes_jump_top(),
+        KeyCode::Char('G') | KeyCode::End => app.episodes_jump_bottom(),
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.episodes_launch_selected(),
+        KeyCode::Char('P') => app.cycle_player(),
+        _ => {}
+    }
+}
+
 fn handle_normal_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => {
-            // Clear locked search results
+            // Clear locked search results, otherwise go back to the start screen
             if !app.search_query.is_empty() {
                 app.search_query.clear();
                 app.search_results.clear();
                 app.selected_channel = 0;
+            } else {
+                app.go_home();
             }
         }
+        KeyCode::Backspace => app.go_home(),
+        KeyCode::Char('1') => app.select_section(app::Section::Live),
+        KeyCode::Char('2') => app.select_section(app::Section::Movies),
+        KeyCode::Char('3') => app.select_section(app::Section::Series),
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
