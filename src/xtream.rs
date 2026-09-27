@@ -245,16 +245,109 @@ impl XtreamProvider {
         action: &str,
     ) -> Result<Vec<T>> {
         let url = self.api_url(action);
-        let body = agent
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .call()
-            .with_context(|| format!("Failed to fetch {action}"))?
-            .into_string()
-            .with_context(|| format!("Failed to read response for {action}"))?;
+        let body = fetch_body(agent, &url, action)?;
         let items: Vec<T> =
             serde_json::from_str(&body).with_context(|| format!("Failed to parse JSON for {action}"))?;
         Ok(items)
+    }
+}
+
+/// GET a URL and return the full body as a String.
+/// ureq's into_string() caps bodies at 10 MB; large VOD catalogs exceed that,
+/// so read through a streaming reader instead.
+fn fetch_body(agent: &ureq::Agent, url: &str, action: &str) -> Result<String> {
+    let resp = agent
+        .get(url)
+        .timeout(std::time::Duration::from_secs(120))
+        .call()
+        .with_context(|| format!("Failed to fetch {action}"))?;
+    let mut body = String::new();
+    std::io::Read::read_to_string(&mut resp.into_reader(), &mut body)
+        .with_context(|| format!("Failed to read response for {action}"))?;
+    Ok(body)
+}
+
+/// One playable episode of a series, resolved via get_series_info.
+#[derive(Debug, Clone)]
+pub struct XtreamEpisode {
+    pub season: u32,
+    pub episode: u32,
+    pub title: String,
+    pub url: String,
+}
+
+impl XtreamProvider {
+    fn series_stream_url(&self, episode_id: &str, ext: &str) -> String {
+        let ext = if ext.is_empty() { "mp4" } else { ext };
+        format!(
+            "{}/series/{}/{}/{}.{}",
+            self.server, self.username, self.password, episode_id, ext
+        )
+    }
+
+    /// Fetch the episode list for one series. The API returns `episodes` either as
+    /// a map of season -> [episode] or as a list of lists; both are handled.
+    pub fn fetch_series_episodes(&self, series_id: u64) -> Result<Vec<XtreamEpisode>> {
+        let agent = ureq::agent();
+        let url = format!("{}&series_id={}", self.api_url("get_series_info"), series_id);
+        let body = fetch_body(&agent, &url, "get_series_info")?;
+        let root: serde_json::Value =
+            serde_json::from_str(&body).context("Failed to parse JSON for get_series_info")?;
+
+        let episodes = root
+            .get("episodes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let lists: Vec<&serde_json::Value> = match &episodes {
+            serde_json::Value::Object(map) => map.values().collect(),
+            serde_json::Value::Array(arr) => arr.iter().collect(),
+            _ => Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        for list in lists {
+            let items: Vec<&serde_json::Value> = match list {
+                serde_json::Value::Array(arr) => arr.iter().collect(),
+                other => vec![other],
+            };
+            for ep in items {
+                let id = ep.get("id").map(value_to_string).unwrap_or_default();
+                if id.is_empty() {
+                    continue;
+                }
+                let season = ep.get("season").map(value_to_u32).unwrap_or(0);
+                let episode = ep.get("episode_num").map(value_to_u32).unwrap_or(0);
+                let title = ep.get("title").map(value_to_string).unwrap_or_default();
+                let ext = ep
+                    .get("container_extension")
+                    .map(value_to_string)
+                    .unwrap_or_default();
+                out.push(XtreamEpisode {
+                    season,
+                    episode,
+                    title,
+                    url: self.series_stream_url(&id, &ext),
+                });
+            }
+        }
+        out.sort_by_key(|e| (e.season, e.episode));
+        Ok(out)
+    }
+}
+
+fn value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn value_to_u32(v: &serde_json::Value) -> u32 {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
+        serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
+        _ => 0,
     }
 }
 
