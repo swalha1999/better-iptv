@@ -28,10 +28,32 @@ impl fmt::Display for Player {
     }
 }
 
+/// Resolve the VLC executable: `vlc` on PATH, otherwise the macOS app bundle.
+fn vlc_binary() -> String {
+    let on_path = std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("vlc").is_file())
+        })
+        .unwrap_or(false);
+    if on_path {
+        return "vlc".to_string();
+    }
+    for candidate in [
+        "/Applications/VLC.app/Contents/MacOS/VLC",
+        "/opt/homebrew/bin/vlc",
+        "/usr/local/bin/vlc",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate.to_string();
+        }
+    }
+    "vlc".to_string()
+}
+
 pub fn launch(player: Player, url: &str, log: &AppLog) -> Result<()> {
     let mut cmd = match player {
         Player::Vlc => {
-            let mut c = std::process::Command::new("vlc");
+            let mut c = std::process::Command::new(vlc_binary());
             c.arg(url).arg("--no-video-title-show");
             c
         }
