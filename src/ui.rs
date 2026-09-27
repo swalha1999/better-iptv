@@ -10,9 +10,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-const FSI: char = '\u{2068}';
-const PDI: char = '\u{2069}';
-const LRM: char = '\u{200E}';
+/// U+2800 BRAILLE PATTERN BLANK: renders as an empty cell but has bidi class L.
+/// Appending it after right-to-left text ends the RTL run, so digits, borders
+/// and text further along the row keep their left-to-right positions.
+const RTL_BREAK: char = '\u{2800}';
 
 fn has_rtl(s: &str) -> bool {
     s.chars().any(|c| {
@@ -24,25 +25,29 @@ fn has_rtl(s: &str) -> bool {
 }
 
 /// Truncate `s` to at most `max_width` terminal columns and, when it contains
-/// right-to-left script, wrap it in a bidi isolate. Terminals that run the
-/// Unicode bidi algorithm per screen row would otherwise pull neighbouring
-/// digits, borders and even text from the next pane into the RTL run.
+/// right-to-left script, terminate it with an invisible strong-LTR character.
+///
+/// Terminals that run the Unicode bidi algorithm per screen row would otherwise
+/// pull neighbouring digits, borders and even text from the next pane into the
+/// RTL run. Zero-width bidi marks do not help: ratatui drops zero-width
+/// graphemes, and such terminals only classify the first codepoint of a cell.
 fn display_name(s: &str, max_width: usize) -> String {
+    let rtl = has_rtl(s);
+    let budget = if rtl { max_width.saturating_sub(1) } else { max_width };
     let mut out = String::new();
     let mut width = 0;
     for c in s.chars() {
         let w = c.width().unwrap_or(0);
-        if width + w > max_width {
+        if width + w > budget {
             break;
         }
         width += w;
         out.push(c);
     }
     if has_rtl(&out) {
-        format!("{FSI}{out}{PDI}{LRM}")
-    } else {
-        out
+        out.push(RTL_BREAK);
     }
+    out
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -1593,18 +1598,17 @@ mod bidi_tests {
     }
 
     #[test]
-    fn rtl_names_are_isolated() {
+    fn rtl_names_end_with_a_break() {
         let out = display_name("Afghanistan - أفغانستان", 40);
-        assert!(out.starts_with(FSI));
-        assert!(out.ends_with(&format!("{PDI}{LRM}")));
-        assert!(out.contains("أفغانستان"));
+        assert_eq!(out, format!("Afghanistan - أفغانستان{RTL_BREAK}"));
     }
 
     #[test]
-    fn names_are_truncated_before_marks() {
-        let out = display_name("Afghanistan - أفغانستان", 5);
-        assert_eq!(out, "Afgha");
-        let out = display_name("أفغانستان Afghanistan", 3);
-        assert_eq!(out, format!("{FSI}أفغ{PDI}{LRM}"));
+    fn names_are_truncated_with_room_for_the_break() {
+        assert_eq!(display_name("Afghanistan - أفغانستان", 5), "Afgh");
+        assert_eq!(
+            display_name("أفغانستان Afghanistan", 4),
+            format!("أفغ{RTL_BREAK}")
+        );
     }
 }
