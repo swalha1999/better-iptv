@@ -81,6 +81,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
+ "unicode-width 0.1.14",
  "ureq",
 ]
 

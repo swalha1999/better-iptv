@@ -8,6 +8,42 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
+
+const FSI: char = '\u{2068}';
+const PDI: char = '\u{2069}';
+const LRM: char = '\u{200E}';
+
+fn has_rtl(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c as u32,
+            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF
+        )
+    })
+}
+
+/// Truncate `s` to at most `max_width` terminal columns and, when it contains
+/// right-to-left script, wrap it in a bidi isolate. Terminals that run the
+/// Unicode bidi algorithm per screen row would otherwise pull neighbouring
+/// digits, borders and even text from the next pane into the RTL run.
+fn display_name(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if width + w > max_width {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    if has_rtl(&out) {
+        format!("{FSI}{out}{PDI}{LRM}")
+    } else {
+        out
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     if app.mode == AppMode::Home {
@@ -144,7 +180,8 @@ fn draw_episodes_overlay(f: &mut Frame, app: &App) {
             } else {
                 Style::default().fg(app.theme.text)
             };
-            ListItem::new(format!("  {}", ep.label)).style(style)
+            let max = (chunks[0].width as usize).saturating_sub(6);
+            ListItem::new(format!("  {}", display_name(&ep.label, max))).style(style)
         })
         .collect();
 
@@ -205,7 +242,10 @@ fn draw_groups(f: &mut Frame, app: &App, area: Rect) {
         .map(|&gi| {
             let group = &app.playlist.groups[gi];
             let count = app.group_count(gi);
-            let text = format!("  {} ({count})", group);
+            let count_str = format!(" ({count})");
+            // borders (2) + highlight symbol (2) + indent (2)
+            let max = (area.width as usize).saturating_sub(6 + count_str.len());
+            let text = format!("  {}{count_str}", display_name(group, max));
             let style = if gi == app.selected_group && app.mode != AppMode::Search {
                 Style::default()
                     .fg(app.theme.highlight)
@@ -267,7 +307,10 @@ fn draw_channels(f: &mut Frame, app: &App, area: Rect) {
             };
 
             // Build lines: channel name + optional EPG info
-            let title_line = Line::from(format!("  {num}. {}{star}", ch.name));
+            let prefix = format!("  {num}. ");
+            // borders (2) + highlight symbol (2) + prefix + star (2)
+            let max = (area.width as usize).saturating_sub(6 + prefix.len());
+            let title_line = Line::from(format!("{prefix}{}{star}", display_name(&ch.name, max)));
 
             let mut lines = vec![title_line];
 
@@ -278,7 +321,10 @@ fn draw_channels(f: &mut Frame, app: &App, area: Rect) {
                         let epg_line = Line::from(vec![
                             Span::raw("     "),
                             Span::styled(
-                                format!("▶ {} (until {until})", prog.title),
+                                format!(
+                                    "▶ {} (until {until})",
+                                    display_name(&prog.title, (area.width as usize).saturating_sub(24))
+                                ),
                                 Style::default().fg(app.theme.text_dim),
                             ),
                         ]);
@@ -557,7 +603,7 @@ fn draw_guide_overlay(f: &mut Frame, app: &App) {
         };
 
         // Channel name (truncated)
-        let name: String = ch.name.chars().take((channel_col_width - 2) as usize).collect();
+        let name = display_name(&ch.name, (channel_col_width as usize).saturating_sub(2));
         let star = if app.is_favorite(ch_idx) { "★" } else { "" };
         let display_name = format!("{}{}", name, star);
         buf.set_string(inner.x, y, &display_name, name_style);
@@ -728,7 +774,7 @@ fn draw_series_overlay(f: &mut Frame, app: &App) {
                     let text = format!(
                         "{} {} ({} season{}, {})",
                         arrow,
-                        series.name,
+                        display_name(&series.name, 80),
                         season_count,
                         if season_count == 1 { "" } else { "s" },
                         ep_str,
@@ -779,9 +825,9 @@ fn draw_series_overlay(f: &mut Frame, app: &App) {
                     let text = if state.show_duplicates {
                         let info = build_source_info(ch);
                         let label = if ep.is_duplicate { "dupe" } else { "primary" };
-                        format!("      S{:02}E{:02}  {} [{}:{}]", ep.season, ep.episode, ep.name, label, info)
+                        format!("      S{:02}E{:02}  {} [{}:{}]", ep.season, ep.episode, display_name(&ep.name, 80), label, info)
                     } else {
-                        format!("      S{:02}E{:02}  {}", ep.season, ep.episode, ep.name)
+                        format!("      S{:02}E{:02}  {}", ep.season, ep.episode, display_name(&ep.name, 80))
                     };
                     let style = if ep.is_duplicate {
                         Style::default().fg(app.theme.text_dim)
@@ -1535,4 +1581,30 @@ fn draw_timezone_overlay(f: &mut Frame, app: &App) {
         ),
     ]);
     f.render_widget(Paragraph::new(status), chunks[3]);
+}
+
+#[cfg(test)]
+mod bidi_tests {
+    use super::*;
+
+    #[test]
+    fn latin_names_are_untouched() {
+        assert_eq!(display_name("Bein Sport HD", 40), "Bein Sport HD");
+    }
+
+    #[test]
+    fn rtl_names_are_isolated() {
+        let out = display_name("Afghanistan - أفغانستان", 40);
+        assert!(out.starts_with(FSI));
+        assert!(out.ends_with(&format!("{PDI}{LRM}")));
+        assert!(out.contains("أفغانستان"));
+    }
+
+    #[test]
+    fn names_are_truncated_before_marks() {
+        let out = display_name("Afghanistan - أفغانستان", 5);
+        assert_eq!(out, "Afgha");
+        let out = display_name("أفغانستان Afghanistan", 3);
+        assert_eq!(out, format!("{FSI}أفغ{PDI}{LRM}"));
+    }
 }
